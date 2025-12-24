@@ -1,427 +1,351 @@
+# classification_analysis.py
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.tree import DecisionTreeClassifier, plot_tree
-from sklearn.cluster import KMeans
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, silhouette_score
 from sklearn.preprocessing import StandardScaler
-import warnings
-
-warnings.filterwarnings('ignore')
+from sklearn.tree import DecisionTreeClassifier, plot_tree
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score,
+    confusion_matrix
+)
+import matplotlib.pyplot as plt
 
 
 def show_classification_analysis(df):
-    """Display the classification analysis page."""
-    st.title("Classification Analysis of Crime Statistics")
+    """Display the classification analysis page with Decision Tree and k-NN."""
+    st.title("Classification Analysis")
 
     col1, col2 = st.columns([1, 3])
 
     with col1:
-        st.subheader("Analysis Parameters")
+        st.subheader("Settings")
 
-        # Select classification type
+        # Classification type selection
         classification_type = st.radio(
             "Classification Type",
-            ('Decision Tree', 'K-means Clustering')
+            ["Binary (High/Low Risk)", "Multi-class (Risk Levels)"]
         )
 
-        if classification_type == 'Decision Tree':
-            st.subheader("Decision Tree Parameters")
+        # Target crime type
+        crime_types = sorted(df['Type of crime'].unique())
+        target_crime = st.selectbox("Target Crime Type", crime_types)
 
-            # Select region
-            region = st.selectbox('Select Region', sorted(df['Region'].unique()), key='dt_region')
+        # Year range
+        years = sorted(df['Year'].unique())
+        year_range = st.slider(
+            "Training Years",
+            min_value=min(years),
+            max_value=max(years),
+            value=(min(years), max(years) - 1)
+        )
+        train_years = list(range(year_range[0], year_range[1] + 1))
+        test_year = year_range[1] + 1 if year_range[1] + 1 <= max(years) else None
 
-            # Select crime type for prediction
-            crime_type = st.selectbox('Select Crime Type', sorted(df['Type of crime'].unique()), key='dt_crime')
+        # Algorithm selection
+        algorithm = st.radio(
+            "Algorithm",
+            ["Decision Tree", "k-Nearest Neighbors (kNN)"]
+        )
 
-            # Define threshold for classification (high/low crime)
-            years = sorted(df['Year'].unique())
-            year_range = st.slider('Year Range', min_value=min(years), max_value=max(years),
-                                   value=(min(years), max(years)), key='dt_year_range')
+        # Algorithm-specific parameters
+        if algorithm == "Decision Tree":
+            max_depth = st.slider("Max Depth", 1, 20, 5)
+            criterion = st.selectbox("Split Criterion", ["gini", "entropy"])
+            # NEW: Visualization depth control
+            viz_depth = st.slider("Visualization Depth", 1, max_depth, min(3, max_depth))
+        else:  # kNN
+            n_neighbors = st.slider("Number of Neighbors (k)", 1, 30, 5)
+            metric = st.selectbox("Distance Metric", ["euclidean", "manhattan", "minkowski"])
 
-            # Decision tree parameters
-            max_depth = st.slider('Maximum Tree Depth', 1, 10, 3)
-            min_samples_split = st.slider('Minimum Samples to Split', 2, 20, 2)
+        # Features selection
+        use_other_crimes = st.checkbox("Use other crime types as features", value=True)
+        include_year = st.checkbox("Include Year as feature", value=True)
 
-        else:  # K-means Clustering
-            st.subheader("K-means Clustering Parameters")
-
-            # Select what to cluster
-            cluster_type = st.radio('Cluster By', ['Regions', 'Crime Types'])
-
-            if cluster_type == 'Regions':
-                # Select crime types to use as features
-                crime_types = sorted(df['Type of crime'].unique())
-                selected_crimes = st.multiselect(
-                    'Select Crime Types as Features',
-                    crime_types,
-                    default=crime_types[:3]
-                )
-                year = st.selectbox('Select Year', sorted(df['Year'].unique()), key='km_year')
-
-            else:  # Cluster Crime Types
-                # Select regions to use as features
-                regions = sorted(df[df['Region'] != 'Russian Federation']['Region'].unique())
-                selected_regions = st.multiselect(
-                    'Select Regions as Features',
-                    regions,
-                    default=regions[:3]
-                )
-                year = st.selectbox('Select Year', sorted(df['Year'].unique()), key='km_crime_year')
-
-            # K-means parameters
-            n_clusters = st.slider('Number of Clusters', 2, 10, 3)
-            random_state = st.number_input('Random State', value=42, min_value=0, step=1)
+        run_model = st.button("Run Classification")
 
     with col2:
-        if classification_type == 'Decision Tree':
-            # Filter data for the selected region, crime type, and year range
-            filtered_df = df[
-                (df['Region'] == region) &
-                (df['Type of crime'] == crime_type) &
-                (df['Year'].between(year_range[0], year_range[1]))
-                ].sort_values('Year')
+        if not run_model:
+            st.info("👈 Configure settings and click **Run Classification** to start.")
+            return
 
-            if filtered_df.empty:
-                st.warning("No data available for the selected parameters.")
-            else:
-                # Prepare features (year) and target (crime levels)
-                X = filtered_df[['Year']].values
+        # === Validate data structure ===
+        required_cols = {'Type of crime', 'Region', 'Year', 'The number of crimes (cases per 100.000 population)'}
+        if not required_cols.issubset(df.columns):
+            st.error("Required columns missing. Check data schema.")
+            return
 
-                # Use crimes per 100,000 population for classification
-                crime_col = 'The number of crimes (cases per 100.000 population)'
-                crime_values = filtered_df[crime_col].values
-
-                # Create multi-class target based on quantiles
-                quantiles = np.percentile(crime_values, [25, 50, 75])
-                y = np.zeros(len(crime_values), dtype=int)
-                y[crime_values > quantiles[2]] = 3  # Very High
-                y[(crime_values > quantiles[1]) & (crime_values <= quantiles[2])] = 2  # High
-                y[(crime_values > quantiles[0]) & (crime_values <= quantiles[1])] = 1  # Medium
-                # y <= quantiles[0] remains 0 # Low
-
-                # Create descriptive labels for the classes
-                class_labels = ['Low', 'Medium', 'High', 'Very High']
-
-                # Split data into train and test sets
-                X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
-
-                # Train decision tree classifier
-                dt_classifier = DecisionTreeClassifier(
-                    max_depth=max_depth,
-                    min_samples_split=min_samples_split,
-                    random_state=42
-                )
-                dt_classifier.fit(X_train, y_train)
-
-                # Make predictions
-                y_pred = dt_classifier.predict(X_test)
-                train_pred = dt_classifier.predict(X_train)
-
-                # Calculate accuracy
-                train_accuracy = accuracy_score(y_train, train_pred)
-                test_accuracy = accuracy_score(y_test, y_pred)
-
-                # Create visualization for the decision boundaries
-                fig = go.Figure()
-
-                # Add training data points with color by class
-                for class_idx, class_name in enumerate(class_labels):
-                    mask = y_train == class_idx
-                    if np.any(mask):
-                        fig.add_trace(go.Scatter(
-                            x=X_train[mask].flatten(),
-                            y=y_train[mask],
-                            mode='markers',
-                            name=f'Training ({class_name})',
-                            marker=dict(size=10, symbol='circle')
-                        ))
-
-                # Add test data points with color by class
-                for class_idx, class_name in enumerate(class_labels):
-                    mask = y_test == class_idx
-                    if np.any(mask):
-                        fig.add_trace(go.Scatter(
-                            x=X_test[mask].flatten(),
-                            y=y_test[mask],
-                            mode='markers',
-                            name=f'Test ({class_name})',
-                            marker=dict(size=10, symbol='triangle-up')
-                        ))
-
-                # Add decision boundaries
-                x_boundary = np.linspace(X.min(), X.max(), 1000).reshape(-1, 1)
-                y_boundary = dt_classifier.predict(x_boundary)
-                fig.add_trace(go.Scatter(
-                    x=x_boundary.flatten(),
-                    y=y_boundary,
-                    mode='lines',
-                    name='Decision Boundary',
-                    line=dict(color='red', width=3, dash='dash')
-                ))
-
-                fig.update_layout(
-                    title=f'Decision Tree Classification: {crime_type} in {region} (Level Classification)',
-                    xaxis_title='Year',
-                    yaxis_title='Crime Level',
-                    yaxis=dict(tickvals=[0, 1, 2, 3], ticktext=class_labels),
-                    legend_title='Data Type'
-                )
-
-                st.plotly_chart(fig, use_container_width=True)
-
-                # Display classification results
-                st.subheader("Classification Results")
-
-                col_acc1, col_acc2 = st.columns(2)
-                with col_acc1:
-                    st.write(f"**Training Accuracy:** {train_accuracy:.2f}")
-                with col_acc2:
-                    st.write(f"**Test Accuracy:** {test_accuracy:.2f}")
-
-                st.write("**Classification Thresholds (Crimes per 100k population):**")
-                st.write(f"- Low: ≤ {quantiles[0]:.1f}")
-                st.write(f"- Medium: {quantiles[0]:.1f} - {quantiles[1]:.1f}")
-                st.write(f"- High: {quantiles[1]:.1f} - {quantiles[2]:.1f}")
-                st.write(f"- Very High: > {quantiles[2]:.1f}")
-
-                # Display classification report
-                st.subheader("Classification Report")
-                report = classification_report(y_test, y_pred, target_names=class_labels, output_dict=True)
-                report_df = pd.DataFrame(report).transpose()
-                st.dataframe(report_df)
-
-                # Display confusion matrix
-                st.subheader("Confusion Matrix")
-                cm = confusion_matrix(y_test, y_pred)
-                fig_cm, ax = plt.subplots(figsize=(10, 8))
-                sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                            xticklabels=class_labels,
-                            yticklabels=class_labels,
-                            ax=ax)
-                plt.xlabel('Predicted')
-                plt.ylabel('Actual')
-                plt.title('Confusion Matrix')
-                st.pyplot(fig_cm)
-
-                # Display decision tree
-                st.subheader("Decision Tree Visualization")
-
-                # Limit tree depth for visualization clarity
-                vis_depth = min(max_depth, 4)
-                vis_classifier = DecisionTreeClassifier(
-                    max_depth=vis_depth,
-                    min_samples_split=min_samples_split,
-                    random_state=42
-                )
-                vis_classifier.fit(X, y)
-
-                fig_tree, ax = plt.subplots(figsize=(20, 10))
-                plot_tree(vis_classifier,
-                          feature_names=['Year'],
-                          class_names=class_labels,
-                          filled=True,
-                          rounded=True,
-                          fontsize=10,
-                          ax=ax)
-                plt.title(f'Decision Tree for {crime_type} in {region} (Depth={vis_depth})')
-                st.pyplot(fig_tree)
-
-                # Display feature importance
-                st.subheader("Feature Importance")
-                feature_importance = pd.DataFrame({
-                    'Feature': ['Year'],
-                    'Importance': [dt_classifier.feature_importances_[0]]
-                })
-                st.dataframe(feature_importance)
-
-        else:  # K-means Clustering
-            if cluster_type == 'Regions':
-                if not selected_crimes:
-                    st.warning("Please select at least one crime type for clustering.")
-                    return
-
-                # Filter data for the selected year and crime types
-                filtered_df = df[
-                    (df['Year'] == year) &
-                    (df['Type of crime'].isin(selected_crimes)) &
-                    (df['Region'] != 'Russian Federation')
-                    ]
-
-                if filtered_df.empty:
-                    st.warning("No data available for the selected parameters.")
-                    return
-
-                # Pivot data to have regions as rows and crime types as columns
-                pivot_df = filtered_df.pivot_table(
+        # === Prepare wide-format data ===
+        try:
+            def pivot_year(y):
+                d = df[df['Year'] == y]
+                return d.pivot(
                     index='Region',
                     columns='Type of crime',
-                    values='The number of crimes (cases per 100.000 population)',
-                    aggfunc='mean'
+                    values='The number of crimes (cases per 100.000 population)'
                 ).reset_index()
 
-                # Prepare features for clustering
-                feature_cols = [col for col in selected_crimes if col in pivot_df.columns]
-                if not feature_cols:
-                    st.warning("No matching crime types found in the data. Please select different crime types.")
-                    return
-                X = pivot_df[feature_cols].values
+            dfs = []
+            for y in train_years:
+                d = pivot_year(y)
+                d['Year'] = y
+                dfs.append(d)
+            df_wide = pd.concat(dfs, ignore_index=True)
+        except Exception as e:
+            st.error(f"Data reshaping failed: {e}")
+            return
 
-            else:  # Cluster Crime Types
-                if not selected_regions:
-                    st.warning("Please select at least one region for clustering.")
-                    return
+        # === Define class names ===
+        binary_class_names = ["Low Risk", "High Risk"]
+        multi_class_names = ["Low Risk", "Medium Risk", "High Risk"]
 
-                # Filter data for the selected year and regions
-                filtered_df = df[
-                    (df['Year'] == year) &
-                    (df['Region'].isin(selected_regions))
-                    ]
+        # === Create target variable ===
+        if classification_type == "Binary (High/Low Risk)":
+            threshold = df_wide[target_crime].median()
+            df_wide['Target'] = (df_wide[target_crime] > threshold).astype(int)
+            class_names = binary_class_names
+        else:  # Multi-class
+            quantiles = np.quantile(df_wide[target_crime], [0.33, 0.66])
+            df_wide['Target'] = np.select(
+                [
+                    df_wide[target_crime] <= quantiles[0],
+                    (df_wide[target_crime] > quantiles[0]) & (df_wide[target_crime] <= quantiles[1]),
+                    df_wide[target_crime] > quantiles[1]
+                ],
+                [0, 1, 2],
+                default=2
+            )
+            class_names = multi_class_names
 
-                if filtered_df.empty:
-                    st.warning("No data available for the selected parameters.")
-                    return
+        # === AUTO-SWITCH: Check if all classes exist ===
+        unique_classes = df_wide['Target'].nunique()
+        if classification_type == "Multi-class (Risk Levels)" and unique_classes < 3:
+            st.warning(f"⚠️ Only {unique_classes} risk classes found in training data! "
+                       "Switching to binary classification.")
+            threshold = df_wide[target_crime].median()
+            df_wide['Target'] = (df_wide[target_crime] > threshold).astype(int)
+            classification_type = "Binary (High/Low Risk)"
+            class_names = binary_class_names
 
-                # Pivot data to have crime types as rows and regions as columns
-                pivot_df = filtered_df.pivot_table(
-                    index='Type of crime',
-                    columns='Region',
-                    values='The number of crimes (cases per 100.000 population)',
-                    aggfunc='mean'
-                ).reset_index()
+        # === Prepare features ===
+        features = []
+        if include_year:
+            features.append('Year')
+        if use_other_crimes:
+            other_crimes = [c for c in df_wide.columns if c != target_crime and c not in ['Region', 'Year', 'Target']]
+            features.extend(other_crimes)
 
-                # Prepare features for clustering
-                feature_cols = [col for col in selected_regions if col in pivot_df.columns]
-                if not feature_cols:
-                    st.warning("No matching regions found in the data. Please select different regions.")
-                    return
-                X = pivot_df[feature_cols].values
+        if not features:
+            st.error("No features selected. Enable at least one feature source.")
+            return
 
-            # Handle missing values
-            if np.isnan(X).any():
-                st.warning("Data contains missing values. Filling with median values.")
-                for i in range(X.shape[1]):
-                    col_median = np.nanmedian(X[:, i])
-                    X[np.isnan(X[:, i]), i] = col_median
+        X = df_wide[features].copy()
+        y = df_wide['Target'].copy()
 
-            # Standardize features
-            scaler = StandardScaler()
-            X_scaled = scaler.fit_transform(X)
+        # Handle missing values
+        mask = X.notnull().all(axis=1) & y.notnull()
+        X, y = X[mask], y[mask]
+        regions = df_wide.loc[mask, 'Region'].reset_index(drop=True)
 
-            # Apply K-means clustering
-            kmeans = KMeans(n_clusters=n_clusters, random_state=random_state, n_init=10)
-            kmeans.fit(X_scaled)
-            labels = kmeans.labels_
-            centroids = kmeans.cluster_centers_
+        if len(X) < 10:
+            st.error("Not enough valid samples after filtering.")
+            return
 
-            # Add cluster labels to the dataframe
-            pivot_df['Cluster'] = labels
+        # === Train-test split (temporal if possible) ===
+        if test_year and test_year in df['Year'].unique():
+            st.info(f"Using {test_year} as test year (temporal split).")
+            try:
+                df_test = pivot_year(test_year)
+                # Recreate target for test year using SAME thresholds
+                if classification_type == "Binary (High/Low Risk)":
+                    df_test['Target'] = (df_test[target_crime] > threshold).astype(int)
+                else:
+                    df_test['Target'] = np.select(
+                        [
+                            df_test[target_crime] <= quantiles[0],
+                            (df_test[target_crime] > quantiles[0]) & (df_test[target_crime] <= quantiles[1]),
+                            df_test[target_crime] > quantiles[1]
+                        ],
+                        [0, 1, 2],
+                        default=2
+                    )
+                X_test = df_test[features].copy()
+                y_test = df_test['Target'].copy()
+                test_regions = df_test['Region'].copy()
+                mask_test = X_test.notnull().all(axis=1) & y_test.notnull()
+                X_test, y_test, test_regions = X_test[mask_test], y_test[mask_test], test_regions[mask_test]
+                X_train, y_train = X, y
+                train_regions = regions
+            except Exception as e:
+                st.warning(f"Could not prepare temporal test set: {e}. Using random split.")
+                test_year = None
+        else:
+            test_year = None
 
-            # Calculate silhouette score
-            silhouette_avg = silhouette_score(X_scaled, labels)
+        if not test_year:
+            X_train, X_test, y_train, y_test, train_regions, test_regions = train_test_split(
+                X, y, regions,
+                test_size=0.2,
+                random_state=42,
+                stratify=y if len(np.unique(y)) > 1 else None
+            )
+            test_regions = test_regions.reset_index(drop=True)
 
-            # Create visualization based on number of features
-            if len(feature_cols) >= 2:
-                fig = px.scatter(
-                    pivot_df,
-                    x=feature_cols[0],
-                    y=feature_cols[1],
-                    color='Cluster',
-                    hover_name='Region' if cluster_type == 'Regions' else 'Type of crime',
-                    title=f'K-means Clustering of {cluster_type} ({year})',
-                    color_continuous_scale='Viridis'
-                )
+        # === Scale features (critical for kNN) ===
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
 
-                # Add centroid markers
-                centroid_df = pd.DataFrame(centroids, columns=feature_cols)
-                centroid_df['Cluster'] = range(n_clusters)
-                centroid_df['Size'] = 20
+        # === Train model ===
+        if algorithm == "Decision Tree":
+            model = DecisionTreeClassifier(
+                max_depth=max_depth,
+                criterion=criterion,
+                random_state=42
+            )
+        else:  # kNN
+            model = KNeighborsClassifier(
+                n_neighbors=n_neighbors,
+                metric=metric
+            )
 
-                fig.add_trace(go.Scatter(
-                    x=centroid_df[feature_cols[0]],
-                    y=centroid_df[feature_cols[1]],
-                    mode='markers',
-                    marker=dict(size=centroid_df['Size'], color='red', symbol='x'),
-                    name='Centroids'
-                ))
+        model.fit(X_train_scaled, y_train)
+        y_pred = model.predict(X_test_scaled)
 
-                st.plotly_chart(fig, use_container_width=True)
+        # === Metrics ===
+        accuracy = accuracy_score(y_test, y_pred)
+        precision = precision_score(y_test, y_pred, average='weighted', zero_division=0)
+        recall = recall_score(y_test, y_pred, average='weighted', zero_division=0)
+        f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
 
-            # For 3D visualization if we have at least 3 features
-            if len(feature_cols) >= 3:
-                fig_3d = px.scatter_3d(
-                    pivot_df,
-                    x=feature_cols[0],
-                    y=feature_cols[1],
-                    z=feature_cols[2],
-                    color='Cluster',
-                    hover_name='Region' if cluster_type == 'Regions' else 'Type of crime',
-                    title=f'3D K-means Clustering of {cluster_type} ({year})',
-                    color_continuous_scale='Viridis'
-                )
+        st.subheader(f"{algorithm} Results")
+        st.write(f"**Accuracy**: {accuracy:.3f}")
+        st.write(f"**Precision**: {precision:.3f}")
+        st.write(f"**Recall**: {recall:.3f}")
+        st.write(f"**F1-Score**: {f1:.3f}")
 
-                st.plotly_chart(fig_3d, use_container_width=True)
+        # === Confusion Matrix (SAFE VERSION) ===
+        # Get ALL possible classes from training data
+        all_possible_classes = sorted(np.unique(y_train))
+        n_classes_total = len(all_possible_classes)
 
-            # Display clustering results
-            st.subheader("Clustering Results")
+        # Classes actually present in test data and predictions
+        present_classes = sorted(np.unique(np.concatenate([y_test, y_pred])))
 
-            col_clust1, col_clust2 = st.columns(2)
-            with col_clust1:
-                st.write(f"**Number of Clusters:** {n_clusters}")
-            with col_clust2:
-                st.write(f"**Silhouette Score:** {silhouette_avg:.3f}")
-                st.write("*(Higher is better, range: -1 to 1)*")
+        # Build confusion matrix with all possible classes
+        cm = confusion_matrix(y_test, y_pred, labels=range(n_classes_total))
 
-            # Display cluster distribution
-            cluster_counts = pivot_df['Cluster'].value_counts().sort_index()
-            fig_dist = px.bar(
-                x=cluster_counts.index,
-                y=cluster_counts.values,
-                labels={'x': 'Cluster', 'y': 'Number of Items'},
-                title='Cluster Distribution',
-                color=cluster_counts.index
+        # Filter matrix to only present classes
+        mask = np.isin(range(n_classes_total), present_classes)
+        cm_filtered = cm[mask][:, mask]
+
+        # Get class names for present classes
+        dynamic_class_names = [class_names[i] for i in present_classes if i < len(class_names)]
+
+        st.subheader("Confusion Matrix")
+        fig_cm = px.imshow(
+            cm_filtered,
+            text_auto=True,
+            labels=dict(x="Predicted", y="Actual"),
+            x=dynamic_class_names,
+            y=dynamic_class_names,
+            title=f"Confusion Matrix ({algorithm})",
+            color_continuous_scale="Blues"
+        )
+        fig_cm.update_layout(
+            xaxis_title="Predicted Class",
+            yaxis_title="Actual Class"
+        )
+        st.plotly_chart(fig_cm, use_container_width=True)
+
+        # === NEW: Decision Tree Visualization ===
+        if algorithm == "Decision Tree":
+            st.subheader("Decision Tree Structure")
+
+            # Handle class names for plot_tree (must be strings)
+            class_names_str = [str(name) for name in class_names]
+
+            # Create figure with constrained size for readability
+            plt.figure(figsize=(20, 10))
+            plot_tree(
+                model,
+                feature_names=features,
+                class_names=class_names_str,
+                filled=True,
+                rounded=True,
+                proportion=True,
+                max_depth=viz_depth,
+                fontsize=10
+            )
+            plt.title(f"Decision Tree (Max Depth: {max_depth}, Visualized Depth: {viz_depth})")
+
+            # Render in Streamlit
+            st.pyplot(plt, use_container_width=True)
+            plt.close()  # Critical to prevent memory leaks
+
+            st.caption("""
+            **Interpretation Guide**:
+            - **Colored nodes**: Class distribution (red = High Risk, blue = Low Risk, green = Medium Risk)
+            - **Numbers**: (samples, value) = (count, [low, medium, high] distribution)
+            - **Split conditions**: Feature thresholds used for decisions
+            """)
+
+        # === Feature Importance (Decision Tree only) ===
+        if algorithm == "Decision Tree":
+            st.subheader("Feature Importance")
+            importances = model.feature_importances_
+            feat_imp_df = pd.DataFrame({
+                'Feature': features,
+                'Importance': importances
+            }).sort_values('Importance', ascending=False)
+
+            fig_imp = px.bar(
+                feat_imp_df,
+                x='Feature',
+                y='Importance',
+                title="Decision Tree Feature Importance"
+            )
+            st.plotly_chart(fig_imp, use_container_width=True)
+
+        # === kNN Specific: Distance distribution ===
+        if algorithm == "k-Nearest Neighbors (kNN)" and n_neighbors > 1:
+            st.subheader("Neighbor Distance Distribution")
+            distances, _ = model.kneighbors(X_test_scaled)
+            avg_distances = distances.mean(axis=1)
+
+            fig_dist = px.histogram(
+                avg_distances,
+                nbins=20,
+                title="Average Distance to k Neighbors",
+                labels={'value': 'Distance', 'count': 'Count'}
             )
             st.plotly_chart(fig_dist, use_container_width=True)
 
-            # Display cluster details
-            st.subheader("Cluster Details")
+        # === Detailed Results Table ===
+        def get_class_name(label_idx):
+            """Safely get class name by index"""
+            if label_idx < len(class_names):
+                return class_names[label_idx]
+            return f"Class {label_idx}"
 
-            # Create a summary of each cluster
-            cluster_summary = []
-            for cluster_id in range(n_clusters):
-                cluster_data = pivot_df[pivot_df['Cluster'] == cluster_id]
-                if cluster_type == 'Regions':
-                    items = ', '.join(cluster_data['Region'].tolist())
-                else:
-                    items = ', '.join(cluster_data['Type of crime'].tolist())
+        st.subheader("Prediction Results")
+        results_df = pd.DataFrame({
+            'Region': test_regions.values,
+            'Actual Class': [get_class_name(int(i)) for i in y_test],
+            'Predicted Class': [get_class_name(int(i)) for i in y_pred]
+        })
+        st.dataframe(results_df)
 
-                cluster_summary.append({
-                    'Cluster': cluster_id,
-                    'Count': len(cluster_data),
-                    'Items': items[:200] + '...' if len(items) > 200 else items
-                })
-
-            summary_df = pd.DataFrame(cluster_summary)
-            st.dataframe(summary_df)
-
-            # Display centroid values
-            st.subheader("Cluster Centroids (Standardized)")
-
-            centroid_df = pd.DataFrame(centroids, columns=feature_cols)
-            centroid_df.insert(0, 'Cluster', range(n_clusters))
-            st.dataframe(centroid_df)
-
-            # Option to download results
-            st.subheader("Export Results")
-            csv = pivot_df.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                label="Download Clustering Results as CSV",
-                data=csv,
-                file_name=f'clustering_results_{cluster_type.lower()}_{year}.csv',
-                mime='text/csv',
-            )
+        # === Export ===
+        st.markdown("---")
+        csv = results_df.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            "Download Predictions (CSV)",
+            csv,
+            f"classification_{algorithm.replace(' ', '_').lower()}_{target_crime}.csv",
+            "text/csv",
+            key='download-classification'
+        )
